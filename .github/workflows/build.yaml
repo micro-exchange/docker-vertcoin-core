@@ -1,0 +1,110 @@
+name: build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version:
+          - '0.17'
+          - '0.17/alpine'
+      fail-fast: false
+    steps:
+      - name: Set up Docker Buildx
+        uses: crazy-max/ghaction-docker-buildx@v1
+
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Prepare Docker build
+        id: prepare
+        run: |
+          function version { echo "$@" | awk -F. '{ printf("%d%03d%03d%03d\n", $1,$2,$3,$4); }'; }
+
+          VERTCOIN_VERSION=${{matrix.version}}
+          LATEST_VERTCOIN_MAJOR_VERSION=$(ls  | grep 0 | sort -n | tail -n 1)
+          PLATFORMS="linux/amd64"
+          PUSH=false
+          REPO=microexchange/vertcoin-core
+          TAGS=()
+
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+            PUSH=true
+
+            if [[ ${VERTCOIN_VERSION} == *"alpine"* ]]; then
+              TAGS+=("$REPO:$TAG-alpine")
+            else
+              TAGS+=("$REPO:$TAG")
+            fi
+
+            TAG_MAJOR_MINOR=$(echo $TAG | cut -c -4)
+
+            if [ $(version ${TAG_MAJOR_MINOR}) -ne $(version ${VERTCOIN_VERSION}) ]; then
+              echo "Skipping build of base image $VERTCOIN_VERSION/ as ${TAG} is targeted at ${TAG_MAJOR_MINOR}/"
+              exit 0
+            fi
+          else
+            TAGS=("$REPO:${VERTCOIN_VERSION/\//-}")
+
+            if [ $(version ${VERTCOIN_VERSION}) -ge $(version ${LATEST_VERTCOIN_MAJOR_VERSION}) ]; then
+              echo "Version $(version ${VERTCOIN_VERSION}) is greater than or equal to $(version ${LATEST_VERTCOIN_MAJOR_VERSION}), tagging as latest"
+
+              if [[ ${VERTCOIN_VERSION} != *"alpine"* ]]; then
+                TAGS+=("$REPO:latest")
+              else
+                TAGS+=("$REPO:alpine")
+              fi
+            fi
+
+            if [ $GITHUB_REF == "refs/heads/main" ]; then
+              PUSH=true
+            fi
+          fi
+
+          echo ::set-output name=build_date::$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          echo ::set-output name=docker_platforms::${PLATFORMS}
+          echo ::set-output name=docker_username::ruimarinho
+          echo ::set-output name=push::${PUSH}
+          echo ::set-output name=tags::${TAGS[@]}
+          echo ::set-output name=build::true
+      - if:  ${{ steps.prepare.outputs.build }} == 'true'
+        name: Login into Docker Hub
+        env:
+          DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
+          DOCKER_HUB_PASSWORD: ${{ secrets.DOCKER_HUB_PASSWORD }}
+        run: |
+          echo "${DOCKER_HUB_PASSWORD}" | docker login --username "${DOCKER_HUB_USERNAME}" --password-stdin
+
+      - if:  ${{ steps.prepare.outputs.build }} == 'true'
+        name: Build Docker image
+        run: |
+          TAGS=(${{ steps.prepare.outputs.tags }})
+
+          echo "Build date: ${{ steps.prepare.outputs.build_date }}"
+          echo "Docker platform: ${{ steps.prepare.outputs.docker_platforms }}"
+          echo "Push: ${{ steps.prepare.outputs.push }}"
+          echo "Tags: ${{ steps.prepare.outputs.tags }}"
+
+          echo docker buildx build --platform ${{ steps.prepare.outputs.docker_platforms }} \
+            --output "type=image,push=${{steps.prepare.outputs.push}}" \
+            --progress=plain \
+            --build-arg "BUILD_DATE=${{ steps.prepare.outputs.build_date }}" \
+            --build-arg "VCS_REF=${GITHUB_SHA::8}" \
+            $(printf "%s" "${TAGS[@]/#/ --tag }" ) \
+            ${{ matrix.version }}/
+
+          docker buildx build --platform ${{ steps.prepare.outputs.docker_platforms }} \
+            --output "type=image,push=${{steps.prepare.outputs.push}}" \
+            --progress=plain \
+            --build-arg "BUILD_DATE=${{ steps.prepare.outputs.build_date }}" \
+            --build-arg "VCS_REF=${GITHUB_SHA::8}" \
+            $(printf "%s" "${TAGS[@]/#/ --tag }" ) \
+            ${{ matrix.version }}/
+
+      - if:  ${{ steps.prepare.outputs.build }} == 'true'
+        name: Clear Docker credentials
+        run: |
+          rm -f ${HOME}/.docker/config.json
